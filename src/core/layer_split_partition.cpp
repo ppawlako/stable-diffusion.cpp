@@ -155,23 +155,59 @@ namespace sd {
         size_t current_backend = 0;
         int64_t current_used   = 0;
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
-            int64_t bytes = segment_param_bytes[seg_idx];
+            int64_t new_bytes      = 0;
+            ggml_backend_t existing_backend = nullptr;
+            bool all_assigned = true;
+            for (ggml_tensor* param : segment_params[seg_idx]) {
+                auto it = param_assignments.find(param);
+                if (it == param_assignments.end()) {
+                    all_assigned = false;
+                    new_bytes += (int64_t)ggml_nbytes(param);
+                } else if (existing_backend == nullptr) {
+                    existing_backend = it->second;
+                }
+            }
+
+            if (all_assigned && existing_backend != nullptr) {
+                // this segment is already resident from an earlier partition of
+                // the same params (e.g. a second graph plan of the same model):
+                // keep its original backend. Re-checking its bytes against the
+                // current free VRAM would count them twice, because that VRAM
+                // no longer includes them.
+                auto existing_it = std::find(split_backends.begin(), split_backends.end(), existing_backend);
+                if (existing_it == split_backends.end()) {
+                    LOG_ERROR("%s graph-cut layer split: a segment param is assigned to an unavailable backend",
+                              desc);
+                    return false;
+                }
+                size_t backend_idx = (size_t)std::distance(split_backends.begin(), existing_it);
+                backend_by_segment[seg_idx] = split_backends[backend_idx];
+                for (ggml_tensor* param : segment_params[seg_idx]) {
+                    assignment.first_segment_by_backend[backend_idx] = std::min(assignment.first_segment_by_backend[backend_idx], seg_idx);
+                    assignment.last_segment_by_backend[backend_idx]  = std::max(assignment.last_segment_by_backend[backend_idx], seg_idx + 1);
+                    assignment.tensors_by_backend[backend_idx].push_back(param);
+                    assignment.bytes_by_backend[backend_idx] += (int64_t)ggml_nbytes(param);
+                }
+                continue;
+            }
+
+            // only params that still need allocation count against free VRAM
             while (!reuse_assignments && current_backend + 1 < split_backends.size() &&
-                   bytes > 0 &&
-                   current_used + bytes > backend_capacities[current_backend]) {
+                   new_bytes > 0 &&
+                   current_used + new_bytes > backend_capacities[current_backend]) {
                 current_backend++;
                 current_used = 0;
             }
-            if (!reuse_assignments && bytes > 0 && current_used + bytes > backend_capacities[current_backend]) {
+            if (!reuse_assignments && new_bytes > 0 && current_used + new_bytes > backend_capacities[current_backend]) {
                 LOG_ERROR("%s graph-cut layer split: segment %zu needs %.1f MB on %s, but only %.1f MB is available under current VRAM limits",
                           desc,
                           seg_idx,
-                          (current_used + bytes) / (1024.0 * 1024.0),
+                          (current_used + new_bytes) / (1024.0 * 1024.0),
                           layer_split_backend_device_display_name(split_backends[current_backend]).c_str(),
                           backend_capacities[current_backend] / (1024.0 * 1024.0));
                 return false;
             }
-            current_used += bytes;
+            current_used += new_bytes;
 
             for (ggml_tensor* param : segment_params[seg_idx]) {
                 ggml_backend_t target_backend = split_backends[current_backend];

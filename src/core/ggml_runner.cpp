@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <exception>
 #include <map>
+#include <unordered_map>
 #include <utility>
 
 #include "core/ggml_extend.h"
@@ -10,6 +11,7 @@
 #include "core/layer_split_partition.h"
 #include "core/segment_graph_bindings.h"
 #include "core/segment_weight_pipeline.h"
+#include "ggml/src/ggml-impl.h"
 
 using namespace sd;
 
@@ -206,15 +208,107 @@ ggml_backend_t GGMLRunner::backend_for_weight(const ggml_tensor* tensor) const {
     return nullptr;
 }
 
+ggml_backend_t GGMLRunner::backend_for_buffer(const ggml_backend_buffer_t buf) const {
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    if (buft == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    if (ggml_backend_get_device(runtime_backend) == dev) {
+        return runtime_backend;
+    }
+    for (ggml_backend_t backend : extra_runtime_backends) {
+        if (ggml_backend_get_device(backend) == dev) {
+            return backend;
+        }
+    }
+    return nullptr;
+}
+
 void GGMLRunner::pin_multi_device_nodes(ggml_backend_sched_t sched, ggml_cgraph* gf, ggml_cgraph* original_graph) {
     if (sched == nullptr || gf == nullptr) {
         return;
     }
     ggml_backend_t current = runtime_backend;
     const int n_nodes      = ggml_graph_n_nodes(gf);
+
+    // The compute allocator (ggml_gallocr_allocate_node in ggml-alloc.c)
+    // can place a node's data in a buffer owned by a different backend
+    // than the backend the node is pinned to:
+    //   1. a node whose output tensor is a view is never allocated at
+    //      all - its data always aliases the view's base tensor;
+    //   2. an in-place-eligible op (ggml_op_can_inplace) reuses its
+    //      parent's buffer region when the parent has exactly one
+    //      consumer in the graph and no views.
+    // If such a node then executes on its own pinned backend, the kernel
+    // writes to another device's memory (illegal memory access). Before
+    // pinning, resolve the backend that will actually own the node's
+    // data and pin the node there.
+    std::unordered_map<const ggml_tensor*, int> child_count;
+    std::unordered_map<const ggml_tensor*, int> view_count;
     for (int i = 0; i < n_nodes; i++) {
-        ggml_tensor* node    = ggml_graph_node(gf, i);
-        auto node_assignment = graph_cut_layer_split_node_assignments_.find(original_graph == nullptr ? node : ggml_graph_node(original_graph, i));
+        const ggml_tensor* node = ggml_graph_node(gf, i);
+        if (node == nullptr) {
+            continue;
+        }
+        if (node->view_src != nullptr) {
+            view_count[node->view_src] += 1;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (node->src[s] != nullptr) {
+                child_count[node->src[s]] += 1;
+            }
+        }
+    }
+
+    std::unordered_map<const ggml_tensor*, ggml_backend_t> pinned_devices;
+
+    // mirror of ggml_are_same_layout (static in ggml-impl.h, not exported)
+    auto same_layout = [](const ggml_tensor* a, const ggml_tensor* b) -> bool {
+        if (a->type != b->type) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            if (a->ne[d] != b->ne[d] || a->nb[d] != b->nb[d]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // the backend that will own the tensor's data: walk the view chain
+    // to a tensor that was pinned in this pass or is already buffered
+    auto data_device = [&pinned_devices, this](const ggml_tensor* t) -> ggml_backend_t {
+        const ggml_tensor* base = t;
+        while (base != nullptr) {
+            auto it = pinned_devices.find(base);
+            if (it != pinned_devices.end()) {
+                return it->second;
+            }
+            if (base->view_src == nullptr) {
+                break;
+            }
+            base = base->view_src;
+        }
+        if (base != nullptr && base->buffer != nullptr) {
+            return backend_for_buffer(base->buffer);
+        }
+        return nullptr;
+    };
+
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        if (node == nullptr) {
+            continue;
+        }
+        ggml_tensor* orig_node = original_graph == nullptr ? node : ggml_graph_node(original_graph, i);
+        auto node_assignment   = graph_cut_layer_split_node_assignments_.find(orig_node);
         if (node_assignment != graph_cut_layer_split_node_assignments_.end()) {
             current = node_assignment->second;
         }
@@ -230,8 +324,132 @@ void GGMLRunner::pin_multi_device_nodes(ggml_backend_sched_t sched, ggml_cgraph*
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue;
         }
+        ggml_backend_t data_dev = nullptr;
+        if (node->view_src != nullptr) {
+            // the output aliases the view's base tensor
+            data_dev = data_device(node);
+        } else if (ggml_op_can_inplace(node->op)) {
+            // mirror the allocator's in-place fusion: the node reuses
+            // the region of the first eligible parent
+            for (int s = 0; s < GGML_MAX_SRC && data_dev == nullptr; s++) {
+                const ggml_tensor* parent = node->src[s];
+                if (parent == nullptr || parent->buffer != nullptr) {
+                    continue;  // external data cannot be reused
+                }
+                if (parent->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                    continue;
+                }
+                if (!same_layout(node, parent)) {
+                    continue;
+                }
+                auto cc = child_count.find(parent);
+                if (cc == child_count.end() || cc->second != 1) {
+                    continue;
+                }
+                auto vc = view_count.find(parent);
+                if (vc != view_count.end() && vc->second != 0) {
+                    continue;
+                }
+                data_dev = data_device(parent);
+            }
+        }
+        if (data_dev != nullptr) {
+            current = data_dev;
+        }
         if (ggml_backend_supports_op(current, node)) {
             ggml_backend_sched_set_tensor_backend(sched, node, current);
+            pinned_devices[node] = current;
+        }
+    }
+
+    // pass 2: make placement deterministic for unpinned nodes
+    auto aliased_source = [&](const ggml_tensor* n) -> const ggml_tensor* {
+        if (n->view_src != nullptr) {
+            return n->view_src;
+        }
+        if (!ggml_op_can_inplace(n->op)) {
+            return nullptr;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor* parent = n->src[s];
+            if (parent == nullptr || parent->buffer != nullptr) {
+                continue;
+            }
+            if (parent->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                continue;
+            }
+            if (!same_layout(n, parent)) {
+                continue;
+            }
+            auto cc = child_count.find(parent);
+            if (cc == child_count.end() || cc->second != 1) {
+                continue;
+            }
+            auto vc = view_count.find(parent);
+            if (vc != view_count.end() && vc->second != 0) {
+                continue;
+            }
+            return parent;
+        }
+        return nullptr;
+    };
+
+    std::unordered_map<const ggml_tensor*, ggml_backend_t> eff;
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        if (node == nullptr || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        const ggml_tensor* alias = aliased_source(node);
+        if (alias != nullptr) {
+            auto ait = eff.find(alias);
+            ggml_backend_t owner = (ait != eff.end()) ? ait->second : nullptr;
+            if (owner == nullptr) {
+                auto apit = pinned_devices.find(alias);
+                if (apit != pinned_devices.end()) {
+                    owner = apit->second;
+                }
+            }
+            if (owner != nullptr) {
+                auto pit = pinned_devices.find(node);
+                if (pit == pinned_devices.end() || pit->second != owner) {
+                    ggml_backend_sched_set_tensor_backend(sched, node, owner);
+                    pinned_devices[node] = owner;
+                }
+            }
+            eff[node] = owner;
+            continue;
+        }
+        auto pit = pinned_devices.find(node);
+        ggml_backend_t dev = (pit != pinned_devices.end()) ? pit->second : nullptr;
+        if (dev == nullptr && node->view_src != nullptr) {
+            auto vit = eff.find(node->view_src);
+            if (vit != eff.end()) {
+                dev = vit->second;
+            }
+        }
+        for (int s = 0; s < GGML_MAX_SRC && dev == nullptr; s++) {
+            const ggml_tensor* parent = node->src[s];
+            if (parent == nullptr) {
+                continue;
+            }
+            if (parent->buffer != nullptr) {
+                dev = backend_for_buffer(parent->buffer);
+                break;
+            }
+            auto eit = eff.find(parent);
+            if (eit != eff.end() && eit->second != nullptr) {
+                dev = eit->second;
+                break;
+            }
+        }
+        if (dev == nullptr) {
+            dev = current;
+        }
+        eff[node] = dev;
+        if (pit == pinned_devices.end() && dev != nullptr && ggml_backend_supports_op(dev, node)) {
+            ggml_backend_sched_set_tensor_backend(sched, node, dev);
+            pinned_devices[node] = dev;
         }
     }
 }

@@ -255,6 +255,8 @@ protected:
 
     ggml_backend_t backend_for_weight(const ggml_tensor* tensor) const;
 
+    ggml_backend_t backend_for_buffer(const ggml_backend_buffer_t buf) const;
+
     // Weightless ops have no scheduler anchor, so pin them to the most recent
     // weight device. Views must stay unpinned or cross-device copies can be
     // skipped for their consumers.
