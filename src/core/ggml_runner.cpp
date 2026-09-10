@@ -646,14 +646,15 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
         return canonical_param_tensor(tensor);
     };
     if (!sd::partition_graph_cut_layer_split(get_desc().c_str(),
-                                             gf,
-                                             plan,
-                                             split_backends,
-                                             graph_cut_layer_split_backend_vram_limits_,
-                                             max_graph_vram_bytes,
-                                             graph_cut_layer_split_assignments_,
-                                             canonicalize_param,
-                                             &assignment)) {
+                                              gf,
+                                              plan,
+                                              split_backends,
+                                              graph_cut_layer_split_backend_vram_limits_,
+                                              graph_cut_layer_split_backend_total_vram_limits_,
+                                              max_graph_vram_bytes,
+                                              graph_cut_layer_split_assignments_,
+                                              canonicalize_param,
+                                              &assignment)) {
         return false;
     }
 
@@ -902,6 +903,10 @@ void GGMLRunner::set_graph_cut_layer_split_backend_vram_limits(const std::vector
     graph_cut_layer_split_primary_notice_logged_ = false;
 }
 
+void GGMLRunner::set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) {
+    graph_cut_layer_split_backend_total_vram_limits_ = limits;
+}
+
 void GGMLRunner::set_runtime_backends(const std::vector<ggml_backend_t>& backends) {
     extra_runtime_backends.clear();
     for (ggml_backend_t backend : backends) {
@@ -953,7 +958,13 @@ std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
                 auto position = std::find(extra_runtime_backends.begin(), extra_runtime_backends.end(), size.backend);
                 index         = static_cast<size_t>(position - extra_runtime_backends.begin()) + 1;
             }
-            if (index < graph_cut_layer_split_backend_vram_limits_.size()) {
+            // The model manager subtracts every resident byte on the backend
+            // (weights of all models plus workspaces of all runners) from this
+            // cap, so it must be the whole-GPU budget, not this model's share.
+            if (index < graph_cut_layer_split_backend_total_vram_limits_.size() &&
+                graph_cut_layer_split_backend_total_vram_limits_[index] > 0) {
+                limit = graph_cut_layer_split_backend_total_vram_limits_[index];
+            } else if (index < graph_cut_layer_split_backend_vram_limits_.size()) {
                 limit = graph_cut_layer_split_backend_vram_limits_[index];
             }
         }

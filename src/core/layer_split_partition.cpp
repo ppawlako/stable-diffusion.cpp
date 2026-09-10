@@ -74,10 +74,8 @@ namespace sd {
     }
 
     static std::vector<int64_t> graph_cut_layer_split_backend_capacities(const std::vector<ggml_backend_t>& backends,
-                                                                         const std::vector<size_t>& backend_vram_limits,
-                                                                         size_t primary_backend_vram_limit) {
+                                                                         int64_t compute_headroom_bytes) {
         std::vector<int64_t> capacities(backends.size(), std::numeric_limits<int64_t>::max() / 4);
-        constexpr int64_t compute_headroom_bytes = 2ll * 1024 * 1024 * 1024;
         for (size_t i = 0; i < backends.size(); i++) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
             size_t free_bytes = 0, total_bytes = 0;
@@ -87,25 +85,20 @@ namespace sd {
             if (free_bytes > 0) {
                 capacities[i] = std::max<int64_t>((int64_t)free_bytes - compute_headroom_bytes, 0);
             }
-            size_t limit_bytes = graph_cut_layer_split_backend_vram_limit(backend_vram_limits,
-                                                                          i,
-                                                                          primary_backend_vram_limit);
-            if (limit_bytes > 0) {
-                capacities[i] = std::min<int64_t>(capacities[i], (int64_t)limit_bytes);
-            }
         }
         return capacities;
     }
 
     bool partition_graph_cut_layer_split(const char* desc,
-                                         ggml_cgraph* gf,
-                                         const sd::ggml_graph_cut::Plan& plan,
-                                         const std::vector<ggml_backend_t>& split_backends,
-                                         const std::vector<size_t>& backend_vram_limits,
-                                         size_t primary_backend_vram_limit,
-                                         std::unordered_map<const ggml_tensor*, ggml_backend_t>& param_assignments,
-                                         const std::function<ggml_tensor*(ggml_tensor*)>& canonical_param_tensor,
-                                         GraphCutLayerSplitAssignment* assignment_out) {
+                                          ggml_cgraph* gf,
+                                          const sd::ggml_graph_cut::Plan& plan,
+                                          const std::vector<ggml_backend_t>& split_backends,
+                                          const std::vector<size_t>& backend_vram_limits,
+                                          const std::vector<size_t>& backend_vram_hard_limits,
+                                          size_t primary_backend_vram_limit,
+                                          std::unordered_map<const ggml_tensor*, ggml_backend_t>& param_assignments,
+                                          const std::function<ggml_tensor*(ggml_tensor*)>& canonical_param_tensor,
+                                          GraphCutLayerSplitAssignment* assignment_out) {
         GGML_ASSERT(gf != nullptr);
         GGML_ASSERT(assignment_out != nullptr);
         GGML_ASSERT(canonical_param_tensor != nullptr);
@@ -142,9 +135,36 @@ namespace sd {
             return false;
         }
 
-        std::vector<int64_t> backend_capacities = graph_cut_layer_split_backend_capacities(split_backends,
-                                                                                           backend_vram_limits,
-                                                                                           primary_backend_vram_limit);
+        // Use VRAM budget as capacity (calculated by VRAM allocator)
+        std::vector<int64_t> backend_capacities(split_backends.size(), 0);
+        for (size_t i = 0; i < split_backends.size(); i++) {
+            if (i < backend_vram_limits.size() && backend_vram_limits[i] > 0) {
+                backend_capacities[i] = (int64_t)backend_vram_limits[i];
+            }
+        }
+        // Hard (physical) limit per backend: the whole-GPU budget. Placement
+        // happens in whole-segment chunks, so when a backend is left
+        // under-filled at a segment boundary the next backend must absorb that
+        // loss; the overflow lands in the compute headroom the allocator
+        // reserved on that GPU. Exceeding the placement budget is therefore
+        // only a warning, while exceeding the hard limit is a real overflow.
+        std::vector<int64_t> backend_hard_limits(split_backends.size(), 0);
+        for (size_t i = 0; i < split_backends.size(); i++) {
+            if (i < backend_vram_hard_limits.size() && backend_vram_hard_limits[i] > 0) {
+                backend_hard_limits[i] = (int64_t)backend_vram_hard_limits[i];
+            } else {
+                backend_hard_limits[i] = backend_capacities[i];
+            }
+        }
+
+        int64_t total_capacity = 0;
+        for (int64_t capacity : backend_capacities) {
+            total_capacity += capacity;
+        }
+        LOG_INFO("%s using VRAM budget: %zu MiB capacity for this model across %zu backend(s)",
+                 desc,
+                 (size_t)(total_capacity / (1024 * 1024)),
+                 split_backends.size());
         // Existing placements may already occupy the reported free VRAM. Reuse
         // them; execution checks missing weights and reclaims memory as needed.
         const bool reuse_assignments = std::all_of(seen_params.begin(), seen_params.end(), [&](ggml_tensor* param) {
@@ -154,6 +174,9 @@ namespace sd {
         std::vector<ggml_backend_t> backend_by_segment(plan.segments.size(), split_backends[0]);
         size_t current_backend = 0;
         int64_t current_used   = 0;
+        // Track model weight allocation per GPU for VRAM limit enforcement
+        std::vector<int64_t> weight_used_by_backend(split_backends.size(), 0);
+        std::vector<bool> capacity_overflow_warned(split_backends.size(), false);
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
             int64_t new_bytes      = 0;
             ggml_backend_t existing_backend = nullptr;
@@ -198,16 +221,29 @@ namespace sd {
                 current_backend++;
                 current_used = 0;
             }
-            if (!reuse_assignments && new_bytes > 0 && current_used + new_bytes > backend_capacities[current_backend]) {
-                LOG_ERROR("%s graph-cut layer split: segment %zu needs %.1f MB on %s, but only %.1f MB is available under current VRAM limits",
+            if (!reuse_assignments && new_bytes > 0 && current_used + new_bytes > backend_hard_limits[current_backend]) {
+                LOG_ERROR("%s graph-cut layer split: segment %zu needs %.1f MiB on %s, but only %.1f MiB is available under current VRAM limits",
                           desc,
                           seg_idx,
                           (current_used + new_bytes) / (1024.0 * 1024.0),
                           layer_split_backend_device_display_name(split_backends[current_backend]).c_str(),
-                          backend_capacities[current_backend] / (1024.0 * 1024.0));
+                          backend_hard_limits[current_backend] / (1024.0 * 1024.0));
                 return false;
             }
+            if (!reuse_assignments && new_bytes > 0 &&
+                current_used + new_bytes > backend_capacities[current_backend] &&
+                !capacity_overflow_warned[current_backend]) {
+                LOG_WARN("%s graph-cut layer split: %s exceeds this model's VRAM budget by %.1f MiB at a segment boundary; "
+                         "using the reserved compute headroom",
+                         desc,
+                         layer_split_backend_device_display_name(split_backends[current_backend]).c_str(),
+                         (current_used + new_bytes - backend_capacities[current_backend]) / (1024.0 * 1024.0));
+                capacity_overflow_warned[current_backend] = true;
+            }
             current_used += new_bytes;
+            if (new_bytes > 0) {
+                weight_used_by_backend[current_backend] += new_bytes;
+            }
 
             for (ggml_tensor* param : segment_params[seg_idx]) {
                 ggml_backend_t target_backend = split_backends[current_backend];

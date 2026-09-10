@@ -26,15 +26,20 @@ namespace sd {
 
     std::string layer_split_backend_device_display_name(ggml_backend_t backend);
     int layer_split_tensor_block_index(const std::string& name);
+    // backend_vram_limits: this model's placement budget per backend (the
+    // allocator's per-model share). backend_vram_hard_limits: the whole-GPU
+    // budget per backend — the physical wall a backend must not exceed, no
+    // matter which model's weights are being placed.
     bool partition_graph_cut_layer_split(const char* desc,
-                                         ggml_cgraph* gf,
-                                         const sd::ggml_graph_cut::Plan& plan,
-                                         const std::vector<ggml_backend_t>& split_backends,
-                                         const std::vector<size_t>& backend_vram_limits,
-                                         size_t primary_backend_vram_limit,
-                                         std::unordered_map<const ggml_tensor*, ggml_backend_t>& param_assignments,
-                                         const std::function<ggml_tensor*(ggml_tensor*)>& canonical_param_tensor,
-                                         GraphCutLayerSplitAssignment* assignment_out);
+                                          ggml_cgraph* gf,
+                                          const sd::ggml_graph_cut::Plan& plan,
+                                          const std::vector<ggml_backend_t>& split_backends,
+                                          const std::vector<size_t>& backend_vram_limits,
+                                          const std::vector<size_t>& backend_vram_hard_limits,
+                                          size_t primary_backend_vram_limit,
+                                          std::unordered_map<const ggml_tensor*, ggml_backend_t>& param_assignments,
+                                          const std::function<ggml_tensor*(ggml_tensor*)>& canonical_param_tensor,
+                                          GraphCutLayerSplitAssignment* assignment_out);
     void log_graph_cut_layer_split_assignment(const char* desc,
                                               const std::vector<ggml_backend_t>& split_backends,
                                               const GraphCutLayerSplitAssignment& assignment);

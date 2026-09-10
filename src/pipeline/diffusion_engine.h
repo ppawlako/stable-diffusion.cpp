@@ -17,6 +17,7 @@
 #include "core/ggml_graph_cut.h"
 #include "core/tensor.hpp"
 #include "core/util.h"
+#include "core/vram_allocator.h"
 #include "model/adapter/lora.hpp"
 #include "model_builders.h"
 #include "model_manager.h"
@@ -94,6 +95,7 @@ public:
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0, 0, nullptr};
     bool enable_mmap                     = false;
     sd::ggml_graph_cut::MaxVramAssignment max_vram_assignment;
+    sd::VRAMBudget vram_budget;
     bool disable_prefetch          = false;
     bool disable_segmented_compute = false;
     bool eager_load                = false;
@@ -263,6 +265,10 @@ public:
 
     std::vector<size_t> layer_split_vram_limits_for_backends(const std::vector<ggml_backend_t>& backends);
 
+    std::vector<size_t> layer_split_vram_limits_for_diffusion_backends(const std::vector<ggml_backend_t>& backends);
+
+    std::vector<size_t> gpu_total_budget_limits(const std::vector<ggml_backend_t>& backends);
+
     bool ensure_backend_pair(SDBackendModule module);
 
     template <typename T>
@@ -300,7 +306,13 @@ public:
 
     void apply_circular_axes(bool circular_x, bool circular_y);
 
-    bool init_backend();
+    bool init_backend(const sd_ctx_params_t* sd_ctx_params);
+
+    bool calculate_vram_budgets_all(const sd_ctx_params_t* sd_ctx_params);
+
+    int find_backend_index(ggml_backend_t backend);
+
+    size_t estimate_model_size(const std::string& type);
 
     bool row_split_active();
 
