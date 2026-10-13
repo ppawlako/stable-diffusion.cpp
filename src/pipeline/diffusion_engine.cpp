@@ -18,6 +18,7 @@
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
 #include "core/layer_split_partition.h"
+#include "core/vram_allocator.h"
 #include "model.h"
 
 #include "core/rng.hpp"
@@ -353,6 +354,37 @@ std::vector<size_t> StableDiffusionGGML::layer_split_vram_limits_for_backends(co
     return limits;
 }
 
+std::vector<size_t> StableDiffusionGGML::layer_split_vram_limits_for_diffusion_backends(const std::vector<ggml_backend_t>& backends) {
+    std::vector<size_t> limits;
+    limits.reserve(backends.size());
+    for (ggml_backend_t backend : backends) {
+        limits.push_back(max_vram_assignment.bytes_for_backend(backend));
+    }
+    return limits;
+}
+
+// Whole-GPU budget (diffusion + text + vae + compute) per backend, from the
+// calculated VRAM budgets. Unlike the per-model placement limits, this cap
+// must cover every model sharing the GPU: the model manager's budget check
+// subtracts all resident bytes (weights of every model plus workspaces of
+// every runner) from it.
+std::vector<size_t> StableDiffusionGGML::gpu_total_budget_limits(const std::vector<ggml_backend_t>& backends) {
+    std::vector<size_t> totals;
+    totals.reserve(backends.size());
+    for (ggml_backend_t backend : backends) {
+        int idx = find_backend_index(backend);
+        if (idx >= 0 && idx < (int)vram_budget.diffusion.size() &&
+            idx < (int)vram_budget.text.size() && idx < (int)vram_budget.vae.size() &&
+            idx < (int)vram_budget.compute.size()) {
+            totals.push_back(vram_budget.diffusion[idx] + vram_budget.text[idx] +
+                             vram_budget.vae[idx] + vram_budget.compute[idx]);
+        } else {
+            totals.push_back(max_vram_assignment.bytes_for_backend(backend));
+        }
+    }
+    return totals;
+}
+
 bool StableDiffusionGGML::ensure_backend_pair(SDBackendModule module) {
     if (backend_for(module) == nullptr) {
         return false;
@@ -567,7 +599,39 @@ bool StableDiffusionGGML::register_layer_split_runner_params(ModelComponent comp
     }
 
     model->set_runtime_backends(module_backends);
-    model->set_graph_cut_layer_split_backend_vram_limits(layer_split_vram_limits_for_backends(module_backends));
+    // Use calculated VRAM budgets if available:
+    //  - placement limits: this model's own budget per GPU; the partitioner
+    //    must not place more of this model's weights than the budget allows
+    //  - total limits: the whole-GPU budget, used as the model manager's
+    //    hard capacity cap (see gpu_total_budget_limits)
+    if (module == SDBackendModule::DIFFUSION) {
+        std::vector<size_t> limits;
+        for (ggml_backend_t backend : module_backends) {
+            int idx = find_backend_index(backend);
+            if (idx >= 0 && idx < (int)vram_budget.diffusion.size() && vram_budget.diffusion[idx] > 0) {
+                limits.push_back(vram_budget.diffusion[idx]);
+            } else {
+                limits.push_back(max_vram_assignment.bytes_for_backend(backend));
+            }
+        }
+        model->set_graph_cut_layer_split_backend_vram_limits(limits);
+        model->set_graph_cut_layer_split_backend_total_vram_limits(gpu_total_budget_limits(module_backends));
+    } else if (module == SDBackendModule::TE) {
+        std::vector<size_t> limits;
+        for (ggml_backend_t backend : module_backends) {
+            int idx = find_backend_index(backend);
+            if (idx >= 0 && idx < (int)vram_budget.text.size() && vram_budget.text[idx] > 0) {
+                limits.push_back(vram_budget.text[idx]);
+            } else {
+                limits.push_back(max_vram_assignment.bytes_for_backend(backend));
+            }
+        }
+        model->set_graph_cut_layer_split_backend_vram_limits(limits);
+        model->set_graph_cut_layer_split_backend_total_vram_limits(gpu_total_budget_limits(module_backends));
+    } else {
+        model->set_graph_cut_layer_split_backend_vram_limits(layer_split_vram_limits_for_backends(module_backends));
+        model->set_graph_cut_layer_split_backend_total_vram_limits(gpu_total_budget_limits(module_backends));
+    }
     model->set_graph_cut_layer_split_enabled(true);
     const bool params_follow_runtime = backend_manager.params_backend_follows_runtime(module) ||
                                        backend_manager.params_backend_is_disk(module);
@@ -632,7 +696,7 @@ bool StableDiffusionGGML::load_control_net_from_file(const std::string& path) {
     return apply_model_update(std::move(candidate), std::move(next_config), {RunnerGroup::ControlNet});
 }
 
-bool StableDiffusionGGML::init_backend() {
+bool StableDiffusionGGML::init_backend(const sd_ctx_params_t* sd_ctx_params) {
     std::string error;
     if (!backend_manager.init(backend_spec.c_str(),
                               params_backend_spec.c_str(),
@@ -641,7 +705,187 @@ bool StableDiffusionGGML::init_backend() {
         LOG_ERROR("backend config failed: %s", error.c_str());
         return false;
     }
-    return ensure_backend_pair(SDBackendModule::DIFFUSION);
+    if (!ensure_backend_pair(SDBackendModule::DIFFUSION)) {
+        return false;
+    }
+    return calculate_vram_budgets_all(sd_ctx_params);
+}
+
+bool StableDiffusionGGML::calculate_vram_budgets_all(const sd_ctx_params_t* sd_ctx_params) {
+    // Get unique backends and map to GPU indices
+    std::vector<ggml_backend_t> unique_backends;
+    std::vector<size_t> vram_per_gpu;
+    for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE}) {
+        auto backends = backend_manager.runtime_backends(module);
+        for (ggml_backend_t backend : backends) {
+            // Check if already in unique_backends
+            bool found = false;
+            for (ggml_backend_t existing : unique_backends) {
+                if (existing == backend) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                unique_backends.push_back(backend);
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                if (dev != nullptr) {
+                    size_t free_bytes = 0, total_bytes = 0;
+                    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+                    vram_per_gpu.push_back(free_bytes);
+                } else {
+                    vram_per_gpu.push_back(0);
+                }
+            }
+        }
+    }
+    if (vram_per_gpu.empty()) {
+        LOG_WARN("no GPU VRAM information available");
+        return true;  // Fall back to default
+    }
+
+    // Get backend assignments for each model
+    auto diffusion_backends = backend_manager.runtime_backends(SDBackendModule::DIFFUSION);
+    auto text_backends = backend_manager.runtime_backends(SDBackendModule::TE);
+    auto vae_backends = backend_manager.runtime_backends(SDBackendModule::VAE);
+
+    // Convert backends to GPU indices (deduplicated)
+    std::vector<int> diffusion_gpus;
+    for (ggml_backend_t backend : diffusion_backends) {
+        for (size_t i = 0; i < unique_backends.size(); i++) {
+            if (unique_backends[i] == backend) {
+                diffusion_gpus.push_back((int)i);
+                break;
+            }
+        }
+    }
+    std::vector<int> text_gpus;
+    for (ggml_backend_t backend : text_backends) {
+        for (size_t i = 0; i < unique_backends.size(); i++) {
+            if (unique_backends[i] == backend) {
+                text_gpus.push_back((int)i);
+                break;
+            }
+        }
+    }
+    int vae_gpu = -1;
+    for (ggml_backend_t backend : vae_backends) {
+        for (size_t i = 0; i < unique_backends.size(); i++) {
+            if (unique_backends[i] == backend) {
+                vae_gpu = (int)i;
+                break;
+            }
+        }
+    }
+
+    // Get actual model sizes from model loader metadata
+    size_t diffusion_size = 0;
+    size_t text_size = 0;
+    size_t vae_size = 0;
+
+    // Diffusion model size
+    {
+        ModelLoader diffusion_loader;
+        diffusion_loader.set_n_threads(n_threads);
+        if (diffusion_loader.init_from_file(sd_ctx_params->diffusion_model_path, "model.diffusion_model.")) {
+            diffusion_size = diffusion_loader.estimate_size();
+        }
+    }
+
+    // Text encoder size
+    {
+        ModelLoader text_loader;
+        text_loader.set_n_threads(n_threads);
+        if (text_loader.init_from_file(sd_ctx_params->llm_path, "text_encoders.llm.")) {
+            text_size = text_loader.estimate_size();
+        }
+    }
+
+    // VAE size (video + audio VAEs share the VAE backend GPU)
+    {
+        ModelLoader vae_loader;
+        vae_loader.set_n_threads(n_threads);
+        if (vae_loader.init_from_file(sd_ctx_params->vae_path, "vae.")) {
+            vae_size = vae_loader.estimate_size();
+        }
+        if (strlen(SAFE_STR(sd_ctx_params->audio_vae_path)) > 0) {
+            ModelLoader audio_vae_loader;
+            audio_vae_loader.set_n_threads(n_threads);
+            if (audio_vae_loader.init_from_file(sd_ctx_params->audio_vae_path)) {
+                vae_size += audio_vae_loader.estimate_size();
+            }
+        }
+    }
+
+    LOG_INFO("VRAM budget calculation: diffusion=%.1f MB, text=%.1f MB, vae=%.1f MB (video+audio)",
+             diffusion_size / (1024.0 * 1024.0),
+             text_size / (1024.0 * 1024.0),
+             vae_size / (1024.0 * 1024.0));
+
+    // Calculate VRAM budgets
+    vram_budget = sd::calculate_vram_budgets(
+        (int)vram_per_gpu.size(),
+        vram_per_gpu,
+        diffusion_size,
+        text_size,
+        vae_size,
+        diffusion_gpus,
+        text_gpus,
+        vae_gpu
+    );
+
+    LOG_INFO("VRAM budgets calculated for %zu GPUs", vram_per_gpu.size());
+    for (int i = 0; i < (int)vram_per_gpu.size(); i++) {
+        double total = (vram_budget.diffusion[i] + vram_budget.text[i] + vram_budget.vae[i] + vram_budget.compute[i]) / (1024.0 * 1024.0);
+        LOG_INFO("  GPU %d: diffusion=%.1f MB, text=%.1f MB, vae=%.1f MB, compute=%.1f MB, total=%.1f MB",
+                 i,
+                 vram_budget.diffusion[i] / (1024.0 * 1024.0),
+                 vram_budget.text[i] / (1024.0 * 1024.0),
+                 vram_budget.vae[i] / (1024.0 * 1024.0),
+                 vram_budget.compute[i] / (1024.0 * 1024.0),
+                 total);
+    }
+
+    return true;
+}
+
+int StableDiffusionGGML::find_backend_index(ggml_backend_t backend) {
+    // Find backend index in unique_backends
+    std::vector<ggml_backend_t> all_backends;
+    for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE, SDBackendModule::VAE}) {
+        auto backends = backend_manager.runtime_backends(module);
+        for (ggml_backend_t b : backends) {
+            bool found = false;
+            for (ggml_backend_t existing : all_backends) {
+                if (existing == b) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                all_backends.push_back(b);
+            }
+        }
+    }
+    for (size_t i = 0; i < all_backends.size(); i++) {
+        if (all_backends[i] == backend) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+size_t StableDiffusionGGML::estimate_model_size(const std::string& type) {
+    // Estimate model size based on type
+    // This is a rough estimate; actual size depends on quantization
+    if (type == "diffusion") {
+        return 15ll * 1024 * 1024 * 1024;  // 15 GB default
+    } else if (type == "text") {
+        return 13ll * 1024 * 1024 * 1024;  // 13 GB default
+    } else if (type == "vae") {
+        return 5ll * 1024 * 1024 * 1024;   // 5 GB default
+    }
+    return 0;
 }
 
 bool StableDiffusionGGML::row_split_active() {
@@ -1007,7 +1251,7 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
         }
     }
 
-    if (!init_backend()) {
+    if (!init_backend(sd_ctx_params)) {
         return false;
     }
     {

@@ -152,6 +152,7 @@ public:
     virtual void set_runtime_backends(const std::vector<ggml_backend_t>& backends) {}
     virtual void set_graph_cut_layer_split_enabled(bool enabled) {}
     virtual void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) {}
+    virtual void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) {}
     virtual void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {}
     virtual void set_flash_attention_enabled(bool enabled) = 0;
     virtual void set_scale_overrides(float linear_scale, float attn_scale) {}
@@ -233,6 +234,13 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         text_model->set_graph_cut_layer_split_backend_vram_limits(limits);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_graph_cut_layer_split_backend_vram_limits(limits);
+        }
+    }
+
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        text_model->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        if (sd_version_is_sdxl(version)) {
+            text_model2->set_graph_cut_layer_split_backend_total_vram_limits(limits);
         }
     }
 
@@ -750,6 +758,18 @@ struct SD3CLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        if (clip_l) {
+            clip_l->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+        if (clip_g) {
+            clip_g->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+        if (t5) {
+            t5->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1178,6 +1198,15 @@ struct FluxCLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        if (clip_l) {
+            clip_l->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+        if (t5) {
+            t5->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1467,6 +1496,12 @@ struct T5CLIPEmbedder : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        if (t5) {
+            t5->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1687,6 +1722,12 @@ struct MiniT2IConditioner : public Conditioner {
         }
     }
 
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        if (t5) {
+            t5->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+    }
+
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         if (t5) {
             t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
@@ -1866,6 +1907,10 @@ struct AnimaConditioner : public Conditioner {
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override {
         llm->set_graph_cut_layer_split_backend_vram_limits(limits);
+    }
+
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        llm->set_graph_cut_layer_split_backend_total_vram_limits(limits);
     }
 
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
@@ -2095,6 +2140,15 @@ struct LLMEmbedder : public Conditioner {
         }
         if (byt5) {
             byt5->set_graph_cut_layer_split_backend_vram_limits(limits);
+        }
+    }
+
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        if (llm) {
+            llm->set_graph_cut_layer_split_backend_total_vram_limits(limits);
+        }
+        if (byt5) {
+            byt5->set_graph_cut_layer_split_backend_total_vram_limits(limits);
         }
     }
 
@@ -3668,6 +3722,10 @@ struct LTXAVEmbedder : public Conditioner {
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override {
         llm->set_graph_cut_layer_split_backend_vram_limits(limits);
+    }
+
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits) override {
+        llm->set_graph_cut_layer_split_backend_total_vram_limits(limits);
     }
 
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {

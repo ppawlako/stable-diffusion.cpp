@@ -112,6 +112,9 @@ public:
     bool validate_sources(const std::set<std::string>* tensor_names = nullptr) const;
     uint64_t revision() const { return revision_; }
     FileVersions file_versions(const std::vector<std::string>& prefixes = {}) const;
+    // Estimate model size from file size (approximate)
+    size_t estimate_size() const;
+
     bool init_from_file(const std::string& file_path, const std::string& prefix = "");
     void convert_tensors_name();
     bool init_from_file_and_convert_name(const std::string& file_path,

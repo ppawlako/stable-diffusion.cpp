@@ -166,7 +166,12 @@ protected:
 
     size_t max_graph_vram_bytes        = 0;
     bool graph_cut_layer_split_enabled = false;
+    // Per-GPU placement caps for this model's own weights (layer-split partitioner).
     std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
+    // Whole-GPU budget per backend (all models + compute buffer); the model
+    // manager's capacity check subtracts every resident byte from this cap, so
+    // it must cover the full GPU, not just this model.
+    std::vector<size_t> graph_cut_layer_split_backend_total_vram_limits_;
 
     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
     bool multi_device_eval_callback_warned = false;
@@ -254,6 +259,8 @@ protected:
                                ggml_cgraph** gf_out);
 
     ggml_backend_t backend_for_weight(const ggml_tensor* tensor) const;
+
+    ggml_backend_t backend_for_buffer(const ggml_backend_buffer_t buf) const;
 
     // Weightless ops have no scheduler anchor, so pin them to the most recent
     // weight device. Views must stay unpinned or cross-device copies can be
@@ -388,6 +395,8 @@ public:
     void set_graph_cut_layer_split_enabled(bool enabled);
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits);
+
+    void set_graph_cut_layer_split_backend_total_vram_limits(const std::vector<size_t>& limits);
 
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends);
 };
